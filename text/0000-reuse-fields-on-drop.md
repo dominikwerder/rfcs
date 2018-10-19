@@ -215,7 +215,7 @@ Proposal:
 - Add a new field attribute `#[rescue_me]` (naming this attribute is totally up for discussion).
 - Let the compiler call `drop(&mut self)` as usual.
 - After `drop(&mut self)` returned, if the type implements `RescueOnDrop`, let the compiler destructure the
-  `struct` and pass the rescued fields to the specified function.
+  `struct` and pass the rescued fields to the specified function (`Writer::rescue` in this example).
 
 ```rust
 #[derive(RescueOnDrop)]
