@@ -16,6 +16,8 @@ After I started the topic in
 [here](https://internals.rust-lang.org/t/re-use-struct-fields-on-drop-was-drop-mut-self-vs-drop-self/8594)
 after which the discussion moved on to a
 [second](https://internals.rust-lang.org/t/making-drop-more-magic-to-make-it-less-magic/8612) thread.
+This pre-RFC starts with the illustration of the current situation, and continues with a [possible
+solution](#possible-solution-1).
 
 
 # Motivation
@@ -204,7 +206,7 @@ impl Drop for Writer {
 Still, the we could do better:
 
 
-### Possible solution 1
+# Possible solution 1
 
 This proposal is *fully* backwards compatible and does *not* change any `Drop` behavior.
 
