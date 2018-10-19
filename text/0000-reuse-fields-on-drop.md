@@ -1,74 +1,296 @@
-- Feature Name: (fill me in with a unique ident, my_awesome_feature)
-- Start Date: (fill me in with today's date, YYYY-MM-DD)
-- RFC PR: (leave this empty)
-- Rust Issue: (leave this empty)
+- Feature Name: `reuse_fields_on_drop`
+- Start Date: 2018-10-19
+- RFC PR: …
+- Rust Issue: …
+
 
 # Summary
 [summary]: #summary
 
-One paragraph explanation of the feature.
+The fields which a `struct` is made of should be re-usable on drop.
+Currently, we can not move out any fields in `drop(&mut self)`.
+Work-arounds include to use `Option` or `ManuallyDrop` as fields and move *their* content in `drop(&mut self)`.
+Both approaches have drawbacks [issues](#issues).
+I started the topic in
+[here](https://internals.rust-lang.org/t/re-use-struct-fields-on-drop-was-drop-mut-self-vs-drop-self/8594)
+after which the discussion moved on to a
+[second](https://internals.rust-lang.org/t/making-drop-more-magic-to-make-it-less-magic/8612) thread.
+
 
 # Motivation
 [motivation]: #motivation
 
 Why are we doing this? What use cases does it support? What is the expected outcome?
 
+## Illustration of the issue we want to solve
+[issues]: #issues
+
+### Example 1
+
+As an example, imagine a `struct Writer` which owns a `File`.
+When `Writer` gets dropped, we want to make sure that it sends that `File` for further usage.
+
+```rust
+struct Writer {
+  file: File,
+  sender: Sender<File>,
+}
+
+impl Drop for Writer {
+  fn drop(&mut self) {
+    // DOES NOT WORK:
+    self.sender.send(self.file).unwrap();
+  }
+}
+```
+
+This does not work because we can not move `file` or `sender` out of `&mut self`.
+
+
+### Example 2
+
+A straight-forward workaround is to put the fields that we would like to move into `Option`.
+This works, but has disadvantages:
+
+```rust
+struct Writer {
+  // BAD: All member-functions have to deal with a possible `None` even though
+  // we never intend to construct a `Writer` without a `File`.
+  file: Option<File>,
+  sender: Option<Sender<File>>,
+}
+
+impl Drop for Writer {
+  fn drop(&mut self) {
+    match self.sender.take() {
+      Some(sender) => match self.file.take() {
+        Some(file) => sender.send(file).expect("send failed"),
+        None => panic!("That should never happen")
+      }
+      None => panic!("That should never happen")
+    }
+  }
+}
+
+impl Writer {
+  fn write_something(&mut self) {
+    // BAD: Runtime cost for each method call, and unnecessary additional
+    // sad path
+    match &mut self.file {
+      Some(file) => {
+        file.write(b"data")
+      }
+      None => panic!("That should never happen")
+    }
+  }
+}
+```
+
+Example 2 allows us to re-use `File`, but at what cost:
+
+1) We essentially introduced an additional null-like value for the type `Writer` which serves absolutely no
+   purpose, except for enabling us to move out in `drop`.  This is very ugly, especially if we value the
+   principle of making useless/disfunctional state irrepresentable.
+2) We introduced many additional error paths which were not necessary in example 1
+3) We introduced a runtime cost for each call to a member function which wants to
+   use the content of `self.file`
+
+
+### Example 3
+
+A zero-cost work-around which also works on today's Rust would be:
+
+```rust
+struct Writer {
+  /*
+  GOOD: Member functions don't have to check for `None`.
+  BAD: Member functions can see that we use `ManuallyDrop`.  This is not a huge deal, but unnecessary.  We
+  can separate the concerns better as we see below in the proposed solution.
+  */
+  file: ManuallyDrop<File>,
+  sender: ManuallyDrop<Sender<File>>,
+}
+
+impl Drop for Writer {
+  fn drop(&mut self) {
+    // BAD: Have to invoke `unsafe`.
+    let sender = unsafe { ManuallyDrop::into_inner(ptr::read(&self.sender)) };
+    let file = unsafe { ManuallyDrop::into_inner(ptr::read(&self.file)) };
+    sender.send(file).unwrap();
+  }
+}
+
+impl Writer {
+  fn new(file: File, sender: Sender<File>) -> Self {
+    Self {
+      file: ManuallyDrop::new(file),
+      sender: ManuallyDrop::new(sender),
+    }
+  }
+
+  fn write_something(&mut self) {
+    // BAD: Runtime cost for each method call, and unnecessary additional
+    // sad path
+    match &mut self.file {
+      Some(file) => {
+        file.write(b"data")
+      }
+      None => panic!("That should never happen")
+    }
+  }
+}
+```
+
+Example 3 allows us to re-use `File`, similar to example 2, but with the additional advantage that member
+functions don't need to deal with a possible `None` in the fields.  This reduces error paths and runtime
+cost.
+
+
+### Example 4
+
+With some straight-forward `proc-macro` we could reduce the boilerplate.
+The proc macro recognizes the optional `#[rescue_me]` attributes on the fields.
+
+```rust
+#[derive(RescueOnDrop)]
+#[rescue_with="Writer::rescue"]
+#[rescue_before="Writer::do_before_rescue"]
+struct Writer {
+  /*
+  GOOD: Member functions don't have to check for `None`.
+  BAD: Member functions can see that we use `ManuallyDrop`.  This is not a huge deal, but unnecessary.  We
+  can separate the concerns better as we see below in the proposed solution.
+  */
+  #[rescue_me]  file: ManuallyDrop<File>,
+  #[rescue_me]  sender: ManuallyDrop<Sender<File>>,
+  this_will_not_be_rescued: UnimportantType,
+}
+
+impl Writer {
+  fn new(file: File, sender: Sender<File>) -> Self {
+    Self {
+      file: ManuallyDrop::new(file),
+      sender: ManuallyDrop::new(sender),
+    }
+  }
+
+  fn write_something(&mut self) {
+    // GOOD: No check for `None`.
+    file.write(b"data");
+  }
+
+  fn rescue(file: File, sender: Sender<File>) {
+    sender.send(file).expect("sending failed");
+  }
+
+  fn do_before_rescue(&mut self) {
+    // put safe things here which normally would happen in `drop(&mut self)`
+  }
+}
+
+// BEGIN  derive(RescueOnDrop) automatically generates:
+impl Drop for Writer {
+  fn drop(&mut self) {
+    Writer::do_before_rescue(self);
+    let file = unsafe { ManuallyDrop::into_inner(ptr::read(&self.file)) };
+    let sender = unsafe { ManuallyDrop::into_inner(ptr::read(&self.sender)) };
+    Writer::rescue(file, sender);
+  }
+}
+// END of autogenerated code.
+```
+
+
+
+Still, the we could do better:
+
+
+### Possible solution 1
+
+This proposal is *fully* backwards compatible and does *not* change any `Drop` behavior.
+
+Proposal:
+
+- Add a new field attribute `#[rescue_me]` (naming this attribute is totally up for discussion).
+- Let the compiler call `drop(&mut self)` as usual.
+- After `drop(&mut self)` returned, destructure the `struct` and pass the rescued fields to the specified function.
+
+```rust
+#[derive(RescueOnDrop)]
+#[rescue_with="Writer::rescue"]
+struct Writer {
+  // GOOD:  No `ManuallyDrop` needed.
+  #[rescue_me]  file: File,
+  #[rescue_me]  sender: Sender<File>,
+  this_will_not_be_rescued: UnimportantType,
+}
+
+impl Writer {
+  fn new(file: File, sender: Sender<File>) -> Self {
+    // GOOD:  Simple, nothing special here.
+    Self {
+      file,
+      sender,
+    }
+  }
+
+  fn write_something(&mut self) {
+    // GOOD: No check for `None`.
+    file.write(b"data");
+  }
+
+  fn rescue(file: File, sender: Sender<File>) {
+    // GOOD: Can do something useful with the fields.
+    sender.send(file).expect("sending failed");
+  }
+}
+
+impl Drop for Writer {
+  fn drop(&mut self) {
+    // Can do safe things here with the as of yet still functional `&mut self: &mut Writer`
+  }
+}
+```
+
+
+
 # Guide-level explanation
 [guide-level-explanation]: #guide-level-explanation
 
-Explain the proposal as if it was already included in the language and you were teaching it to another Rust programmer. That generally means:
+TODO.
 
-- Introducing new named concepts.
-- Explaining the feature largely in terms of examples.
-- Explaining how Rust programmers should *think* about the feature, and how it should impact the way they use Rust. It should explain the impact as concretely as possible.
-- If applicable, provide sample error messages, deprecation warnings, or migration guidance.
-- If applicable, describe the differences between teaching this to existing Rust programmers and new Rust programmers.
-
-For implementation-oriented RFCs (e.g. for compiler internals), this section should focus on how compiler contributors should think about the change, and give examples of its concrete impact. For policy RFCs, this section should provide an example-driven introduction to the policy, and explain its impact in concrete terms.
 
 # Reference-level explanation
 [reference-level-explanation]: #reference-level-explanation
 
-This is the technical portion of the RFC. Explain the design in sufficient detail that:
+TODO.
 
-- Its interaction with other features is clear.
-- It is reasonably clear how the feature would be implemented.
-- Corner cases are dissected by example.
-
-The section should return to the examples given in the previous section, and explain more fully how the detailed proposal makes those examples work.
 
 # Drawbacks
 [drawbacks]: #drawbacks
 
-Why should we *not* do this?
+TODO.
+
 
 # Rationale and alternatives
 [rationale-and-alternatives]: #rationale-and-alternatives
 
-- Why is this design the best in the space of possible designs?
-- What other designs have been considered and what is the rationale for not choosing them?
-- What is the impact of not doing this?
+TODO.
+
+- Best safety
+- Best separation of concerns
+- Least boilerplate
+- Fully backwards compatible
+
 
 # Prior art
 [prior-art]: #prior-art
 
-Discuss prior art, both the good and the bad, in relation to this proposal.
-A few examples of what this can include are:
+TODO.
 
-- For language, library, cargo, tools, and compiler proposals: Does this feature exist in other programming languages and what experience have their community had?
-- For community proposals: Is this done by some other community and what were their experiences with it?
-- For other teams: What lessons can we learn from what other communities have done here?
-- Papers: Are there any published papers or great posts that discuss this? If you have some relevant papers to refer to, this can serve as a more detailed theoretical background.
-
-This section is intended to encourage you as an author to think about the lessons from other languages, provide readers of your RFC with a fuller picture.
-If there is no prior art, that is fine - your ideas are interesting to us whether they are brand new or if it is an adaptation from other languages.
-
-Note that while precedent set by other languages is some motivation, it does not on its own motivate an RFC.
-Please also take into consideration that rust sometimes intentionally diverges from common language features.
 
 # Unresolved questions
 [unresolved-questions]: #unresolved-questions
 
-- What parts of the design do you expect to resolve through the RFC process before this gets merged?
-- What parts of the design do you expect to resolve through the implementation of this feature before stabilization?
-- What related issues do you consider out of scope for this RFC that could be addressed in the future independently of the solution that comes out of this RFC?
+- Choosing names for any new attribute or macro?
+- Can one handle `enum` as well?
