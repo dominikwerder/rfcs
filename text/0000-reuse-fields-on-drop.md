@@ -10,8 +10,8 @@
 The fields which a `struct` is made of should be re-usable on drop.
 Currently, we can not move out any fields in `drop(&mut self)`.
 Work-arounds include to use `Option` or `ManuallyDrop` as fields and move *their* content in `drop(&mut self)`.
-Both approaches have drawbacks [issues](#issues).
-I started the topic in
+Both approaches have [issues](#issues).
+After I started the topic in
 [here](https://internals.rust-lang.org/t/re-use-struct-fields-on-drop-was-drop-mut-self-vs-drop-self/8594)
 after which the discussion moved on to a
 [second](https://internals.rust-lang.org/t/making-drop-more-magic-to-make-it-less-magic/8612) thread.
@@ -20,15 +20,13 @@ after which the discussion moved on to a
 # Motivation
 [motivation]: #motivation
 
-Why are we doing this? What use cases does it support? What is the expected outcome?
-
-## Illustration of the issue we want to solve
+## Issue with today's Rust
 [issues]: #issues
 
 ### Example 1
 
-As an example, imagine a `struct Writer` which owns a `File`.
-When `Writer` gets dropped, we want to make sure that it sends that `File` for further usage.
+As an example to illustrate the issue, imagine a `struct Writer` which owns a `File`.  When `Writer` gets
+dropped, we want to make sure that it sends that `File` elsewhere for further usage.
 
 ```rust
 struct Writer {
